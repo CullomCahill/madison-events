@@ -1,8 +1,9 @@
 name: Daily Madison Events Scan
 
 on:
-  schedule:
-    - cron: "0 12 * * *"
+  # Schedule disabled: chunked extraction makes ~100 Claude API calls per
+  # run, which adds up fast on autopilot. Trigger manually via
+  # workflow_dispatch (Actions tab -> Run workflow) until this is revisited.
   workflow_dispatch:
 
 jobs:

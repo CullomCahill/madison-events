@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import re
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -11,8 +13,14 @@ import calendar_writer
 import extract
 import gmail_reader
 
+# Email subjects can contain emoji/unicode that Windows' default console
+# codepage (cp1252) can't print; widen stdout so logging never crashes on it.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 STATE_PATH = Path(__file__).parent / "state.json"
 LOOKBACK_DAYS = 30
+MIN_CONFIDENCE = float(os.environ.get("MIN_CONFIDENCE", 0.6))
 SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/calendar",
@@ -41,9 +49,31 @@ def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, indent=2))
 
 
-def fingerprint(title: str, start_datetime: str) -> str:
-    date_part = start_datetime[:10]
-    return f"{title.strip().lower()} {date_part}"
+def _normalize_location(location: str | None) -> str:
+    tokens = re.findall(r"[a-z0-9]+", (location or "").lower())
+    return " ".join(tokens)
+
+
+def fingerprint(event: dict) -> str:
+    """Identity for dedup: date/time/location, NOT the model's title wording
+    (which varies run to run for the same real event).
+    """
+    start = event["start_datetime"]
+    location = _normalize_location(event.get("location"))
+
+    if event.get("recurrence"):
+        # Anchor on weekday+time, not the specific date — the "next
+        # occurrence" date the model picks advances every run, so a
+        # date-based fingerprint would treat the same series as new each time.
+        dt = calendar_writer.naive_datetime(start) if "T" in start else datetime.combine(
+            calendar_writer.date.fromisoformat(start), datetime.min.time()
+        )
+        return f"recurring {dt.strftime('%a').lower()} {dt.strftime('%H:%M')} {location}"
+
+    if "T" not in start:
+        return f"{start} allday {location}"
+
+    return f"{start[:16]} {location}"
 
 
 def main() -> None:
@@ -70,8 +100,12 @@ def main() -> None:
         return
 
     today = run_started_at.date()
-    events = extract.extract_events(emails, today)
-    print(f"madison_events.py: extracted {len(events)} candidate events")
+    candidates, chunk_count = extract.extract_events(emails, today)
+    print(f"madison_events.py: extracted {len(candidates)} candidate events from {chunk_count} chunks")
+
+    merged_events = extract.merge_duplicate_events(candidates, today)
+    merged_away = len(candidates) - len(merged_events)
+    print(f"madison_events.py: merge step consolidated {merged_away} entries -> {len(merged_events)} events")
 
     cal_service = None
     cal_id = None
@@ -80,26 +114,41 @@ def main() -> None:
         cal_id = calendar_writer.get_or_create_radar_calendar(cal_service)
 
     written = 0
-    skipped = 0
+    skipped_confidence = 0
+    skipped_dup = 0
     fingerprints = set(state["fingerprints"])
 
-    for event in events:
+    for event in merged_events:
         if not event.get("title") or not event.get("start_datetime"):
-            skipped += 1
+            skipped_dup += 1
             continue
 
-        fp = fingerprint(event["title"], event["start_datetime"])
+        confidence = event.get("confidence")
+        if confidence is not None and confidence < MIN_CONFIDENCE:
+            skipped_confidence += 1
+            print(
+                f"madison_events.py: skipped (confidence {confidence} < {MIN_CONFIDENCE}): {event['title']}"
+            )
+            continue
+
+        fp = fingerprint(event)
         if fp in fingerprints:
-            skipped += 1
+            skipped_dup += 1
             continue
 
         if args.dry_run:
-            print(f"[dry-run] would write: {event['title']} @ {event['start_datetime']}")
+            preview = calendar_writer.build_event_body(event)
+            reminder = preview["reminders"]["overrides"][0]["minutes"]
+            print(
+                f"[dry-run] would write: {event['title']} | start={preview['start']} "
+                f"end={preview['end']} recurrence={preview.get('recurrence')} "
+                f"reminder_minutes_before={reminder}"
+            )
             continue
 
-        if calendar_writer.check_event_exists(cal_service, cal_id, event["title"], event["start_datetime"]):
+        if calendar_writer.check_event_exists(cal_service, cal_id, event):
             fingerprints.add(fp)
-            skipped += 1
+            skipped_dup += 1
             continue
 
         calendar_writer.write_event(cal_service, cal_id, event)
@@ -112,8 +161,11 @@ def main() -> None:
         save_state(state)
 
     print(
-        f"madison_events.py: summary - {len(emails)} emails scanned, "
-        f"{len(events)} events found, {written} written, {skipped} skipped"
+        "madison_events.py: summary - "
+        f"{len(emails)} emails scanned, {chunk_count} chunks processed, "
+        f"{len(candidates)} candidates extracted, {merged_away} merged as duplicates, "
+        f"{skipped_confidence} skipped by confidence, {skipped_dup} skipped as duplicate, "
+        f"{written} written"
     )
 
 

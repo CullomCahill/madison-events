@@ -7,6 +7,11 @@ from googleapiclient.discovery import build
 # Isthmus), plus cullyPy_ai-labeled mail that's set to skip the inbox.
 QUERY_TEMPLATE = "(in:inbox OR label:cullyPy_ai) after:{after}"
 
+# Fallback escape hatch: if recurring-event consolidation in extract.py
+# proves unreliable for a given sender, add a substring of their address
+# here to skip their mail entirely (e.g. "isthmus@isthmus.com").
+SKIP_SENDERS: list[str] = []
+
 
 def fetch_emails(creds, since_dt: datetime) -> list[dict]:
     service = build("gmail", "v1", credentials=creds)
@@ -28,7 +33,10 @@ def fetch_emails(creds, since_dt: datetime) -> list[dict]:
                 .get(userId="me", id=msg_ref["id"], format="full")
                 .execute()
             )
-            emails.append(_parse_message(msg))
+            parsed = _parse_message(msg)
+            if any(s.lower() in parsed["from"].lower() for s in SKIP_SENDERS):
+                continue
+            emails.append(parsed)
 
         page_token = resp.get("nextPageToken")
         if not page_token:
