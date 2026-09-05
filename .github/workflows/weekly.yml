@@ -1,0 +1,37 @@
+name: Weekly Yoga Calendar Sync
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every Monday 07:00 America/Chicago (12:00 UTC, ignoring DST).
+    - cron: "0 12 * * 1"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        script:
+          - dragonfly_yoga_sync.py
+          - capital_fitness_yoga_sync.py
+          - main_street_yoga_sync.py
+          - perennial_yoga_sync.py
+          - sukha_yoga_sync.py
+          - yoga_coop_sync.py
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run ${{ matrix.script }}
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+          YOGA_CALENDAR_ID: ${{ secrets.YOGA_CALENDAR_ID }}
+        run: python ${{ matrix.script }}
