@@ -187,7 +187,8 @@ def to_event(s):
         lines.append(
             f"Spots open at sync time: {s['remainingSpots']} of {s['capacity']}"
         )
-    lines.append(f"Book: {s.get('link') or BOOKING_PAGE}")
+    booking_link = s.get("link") or BOOKING_PAGE
+    lines.append(f"Book: {booking_link}")
 
     description = (s.get("level") or "").strip()
     if description:
@@ -202,6 +203,7 @@ def to_event(s):
         "end": {"dateTime": ends.isoformat(), "timeZone": "America/Chicago"},
         "transparency": "transparent",  # shows as Free, not Busy
         "reminders": {"useDefault": False, "overrides": []},
+        "source": {"url": booking_link, "title": "Sukha Somatics booking"},
         "extendedProperties": {
             "private": {
                 "source": SOURCE_TAG,

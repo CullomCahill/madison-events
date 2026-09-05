@@ -1,8 +1,8 @@
 """
 Capital Fitness / Yoga Sangha -> Google Calendar
 
-Pulls the week ahead of yoga classes from the studio's own website and writes
-them into the shared "Yoga" Google Calendar.
+Generates the week ahead from a hardcoded weekly grid and writes it into the
+shared "Yoga" Google Calendar.
 
 Run this Monday morning. It writes from max(this Monday 00:00, right now)
 through the following Monday 00:00, local America/Chicago, so a mid-week or
@@ -12,46 +12,29 @@ Idempotent: every event it creates is stamped with a private extended
 property. On each run it deletes anything carrying that stamp inside the
 target window before writing fresh, so re-running never duplicates.
 
-WHY THIS GOES THROUGH THE WEBSITE, NOT MINDBODY
-------------------------------------------------
+HARDCODED, ON PURPOSE
+---------------------
 This studio's Mindbody site (studioid 1956) sits behind Cloudflare bot
 management (`clients.mindbodyonline.com/classic/ws` returns a 403 "Security
 Check" page with a `__cf_bm` challenge cookie even with full browser-style
-headers). That is a JS challenge, not a missing-header problem, and it is not
-solvable with a plain HTTP client -- it would need a real browser.
+headers) -- a JS challenge, not fixable from a plain HTTP client. A first
+pass instead scraped the schedule text off capitalfitness.net/yoga-sangha
+directly, but that page turned out to carry the wrong week's grid mixed in
+with the current one, so the safer route is the same one used for the Yoga
+Co-op: transcribe the grid by hand below and refresh it manually when the
+studio changes its schedule.
 
-capitalfitness.net/yoga-sangha carries its own weekly schedule text directly
-in the page, server-rendered (confirmed: it's present in the raw HTML with no
-JavaScript execution, and the page itself has no bot protection). It is a
-flat Monday-through-Sunday grid with no date attached, no instructor field,
-and no live cancellation data -- the page says as much: "Schedule is subject
-to change. Please check Mindbody below for the most up to date schedule." So
-this is a step down in freshness from a live booking API, but it is a live
-scrape of the studio's own source of truth rather than a hardcoded transcript,
-so it updates automatically whenever they edit the page -- no manual refresh
-needed, unlike the Yoga Co-op script.
+WEEKLY_GRID is exactly the schedule the studio publishes: transcribed
+2026-09-05. Filtering matches how every other script in this repo treats
+this studio's data: `(Group Fitness)` is a literal tag the studio puts on
+its non-yoga classes (CAPFIT HIIT, RUN CLUB, ZUMBA, BOOTCAMP, PUMP IT UP,
+TRX CIRCUIT), so those are dropped on that signal, plus a denylist for
+Pilates. There is no cancellation or instructor data in this source, so the
+event description says so plainly.
 
-HOW THE PAGE IS STRUCTURED
----------------------------
-It's a Wix site. Each day is an `<h6>` heading containing just the day name
-("Monday", "Tuesday", ...), followed by a sibling block holding a `<ul>` of
-`<li>` entries, each rendering (once you strip the styling spans) as:
-
-    6:30am - 7:30am - Pilates Flow
-
-So the parser walks the document in order via `find_all(['h6', 'li'])`,
-tracks the current day as h6 headings with day names are encountered, and
-attaches each subsequent li's parsed text to that day. This is where the
-"(Group Fitness)" tag doubles as a real structured signal:  entries like
-"CAPFIT HIIT (Group Fitness)", "RUN CLUB (Group Fitness)", "ZUMBA (Group
-Fitness)" carry that literal suffix in the source, so they're excluded on
-that alone rather than by guessing at names. Verified against the live page
-2026-09-05: 38 li entries fall inside the seven day sections (6/8/6/6/5/7/0
-Mon-Sun), all of them match the time-range regex, and there were zero strays
-from other parts of the page (17 stray `<li>` elements exist elsewhere on the
-page -- nav menu items and a separate promotional snippet -- but all of them
-sit before the first "Monday" heading in document order, so the day-tracking
-state machine never picks them up).
+*** MAINTENANCE: this needs a manual refresh whenever the studio changes its
+schedule. There is no way to detect that automatically from this source, so
+it can go stale silently. ***
 
 Reads credentials from a .env file in the working directory (or any parent):
     GOOGLE_CLIENT_ID
@@ -60,16 +43,13 @@ Reads credentials from a .env file in the working directory (or any parent):
     YOGA_CALENDAR_ID
 
 Requires:
-    pip install requests beautifulsoup4 python-dotenv google-auth google-api-python-client
+    pip install python-dotenv google-auth google-api-python-client
 """
 
 import datetime as dt
 import os
-import re
 from zoneinfo import ZoneInfo
 
-import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
@@ -78,23 +58,72 @@ load_dotenv()
 
 # ---------------------------------------------------------------- config
 
-PAGE_URL = "https://www.capitalfitness.net/yoga-sangha"
-
 STUDIO = "Yoga Sangha"
 ADDRESS = "15 N. Butler St., Madison, WI 53703"
+BOOKING_PAGE = "https://www.capitalfitness.net/yoga-sangha"
 
 TZ = ZoneInfo("America/Chicago")
 
-DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
-WEEKDAY_INDEX = {name: i for i, name in enumerate(DAY_NAMES)}
+MON, TUE, WED, THU, FRI, SAT, SUN = range(7)
 
-# The page has no discipline tag at all: it is one undifferentiated list of
-# "fitness classes" per day. "(Group Fitness)" is a literal suffix the studio
-# puts on the non-yoga classes in that same list (CAPFIT HIIT, RUN CLUB,
-# ZUMBA, BOOTCAMP, PUMP IT UP, TRX CIRCUIT), so that's a real structured
-# signal, not a guess. On top of that, a denylist for the two other
-# non-yoga-but-still-in-the-list categories, same as the old Mindbody version
-# of this script: Pilates and any guided meditation session.
+# Transcribed verbatim from the studio's published schedule, 2026-09-05.
+#     (weekday, start "HH:MM", end "HH:MM", name)
+WEEKLY_GRID = [
+    (MON, "06:30", "07:30", "Slow Flow"),
+    (MON, "07:45", "08:45", "Morning Vinyasa"),
+    (MON, "12:00", "12:45", "Express Slow Flow"),
+    (MON, "16:15", "17:15", "Ashtanga Inspired"),
+    (MON, "17:30", "18:30", "Vinyasa Flow"),
+    (MON, "18:45", "19:45", "Slow Flow & Restorative"),
+
+    (TUE, "06:30", "07:30", "Pilates Flow"),
+    (TUE, "08:00", "09:00", "Ashtanga Inspired"),
+    (TUE, "12:00", "13:00", "Vinyasa Flow"),
+    (TUE, "16:15", "17:15", "Yoga Strong"),
+    (TUE, "17:30", "18:45", "Heated Slow & Mighty Flow"),
+    (TUE, "19:00", "20:00", "Heated Aroma Moon Flow + Restorative"),
+
+    (WED, "06:15", "07:00", "Express Sunrise Flow"),
+    (WED, "07:15", "08:15", "Vinyasa Flow"),
+    (WED, "12:00", "12:45", "CAPFIT HIIT (Group Fitness)"),
+    (WED, "12:00", "13:00", "Vinyasa Flow"),
+    (WED, "16:15", "17:15", "Align & Flow"),
+    (WED, "17:30", "18:30", "Power Flow"),
+    (WED, "17:45", "18:30", "RUN CLUB (Group Fitness)"),
+    (WED, "18:45", "19:45", "Meditation & Motion"),
+
+    (THU, "06:30", "07:30", "Vinyasa Flow"),
+    (THU, "07:45", "08:45", "Pilates Flow"),
+    (THU, "12:00", "13:00", "Slow Flow"),
+    (THU, "16:15", "17:15", "Foam Roll & Flow"),
+    (THU, "17:30", "18:30", "Mobility Flow"),
+    (THU, "18:45", "19:45", "Heated Core Flow"),
+
+    (FRI, "06:30", "07:30", "Pilates Sculpt"),
+    (FRI, "12:00", "13:00", "Heated Mobility Flow"),
+    (FRI, "16:15", "17:15", "Yin-Yang Reiki Flow"),
+    (FRI, "16:45", "17:30", "RUN CLUB (Group Fitness)"),
+    (FRI, "17:30", "18:30", "Vinyasa Flow"),
+    (FRI, "18:45", "19:45", "Deep Restore"),
+
+    (SAT, "07:45", "08:45", "Pilates Flow"),
+    (SAT, "09:00", "10:00", "Vinyasa Flow"),
+    (SAT, "09:00", "09:45", "BOOTCAMP (Group Fitness)"),
+    (SAT, "10:15", "11:30", "Power Flow"),
+    (SAT, "11:00", "11:45", "ZUMBA (Group Fitness)"),
+
+    (SUN, "08:30", "09:30", "Align & Flow"),
+    (SUN, "09:00", "09:50", "PUMP IT UP (Group Fitness)"),
+    (SUN, "10:00", "10:45", "TRX CIRCUIT (Group Fitness)"),
+    (SUN, "10:00", "11:00", "FLOW"),
+    (SUN, "16:00", "17:00", "Yoga Strong"),
+    (SUN, "17:30", "18:30", "Align & Flow"),
+    (SUN, "18:45", "19:30", "Express Deep Restore"),
+]
+
+# Same treatment as every other script in this repo: "(Group Fitness)" is a
+# literal tag the studio puts on its non-yoga classes, and the rest is a
+# denylist for the other non-yoga category mixed into the same list.
 EXCLUDE_NAME_SUBSTRINGS = ("pilates", "guided meditation")
 EXCLUDE_TAG_SUBSTRING = "(group fitness)"
 
@@ -106,18 +135,6 @@ SCOPES = ["https://www.googleapis.com/auth/calendar"]
 # if two scripts share a tag, each one's cleanup pass deletes the other's
 # events.
 SOURCE_TAG = "capital-fitness-yoga-sync"
-
-HEADERS = {
-    "user-agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
-    ),
-    "accept": "text/html,application/xhtml+xml",
-}
-
-TIME_RANGE_RE = re.compile(
-    r"(\d{1,2}:\d{2}\s*[apAP][mM])\s*-\s*(\d{1,2}:\d{2}\s*[apAP][mM])\s*-\s*(.+)"
-)
 
 
 # ------------------------------------------------------------- time math
@@ -137,94 +154,45 @@ def week_window(now=None):
     return max(monday, now), monday + dt.timedelta(days=7)
 
 
-def _parse_clock(text):
-    """"6:30am" / "7:00pm" -> (hour, minute) in 24h."""
-    text = text.strip().lower().replace(" ", "")
-    m = re.match(r"(\d{1,2}):(\d{2})(am|pm)", text)
-    hour, minute, ampm = int(m.group(1)), int(m.group(2)), m.group(3)
-    if ampm == "pm" and hour != 12:
-        hour += 12
-    if ampm == "am" and hour == 12:
-        hour = 0
-    return hour, minute
+def _at(day, hhmm):
+    hour, minute = (int(x) for x in hhmm.split(":"))
+    return dt.datetime.combine(day, dt.time(hour, minute), tzinfo=TZ)
 
 
-# --------------------------------------------------------------- fetch
-
-def fetch_page():
-    resp = requests.get(PAGE_URL, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
-    return resp.text
-
-
-def parse_grid(html):
-    """Walk the page in document order, tracking the current day heading, and
-    return a flat list of {day, start_hm, end_hm, name} dicts.
-
-    Day headings are `<h6>` elements whose text is exactly a day name. Class
-    rows are `<li>` elements that appear after one, each rendering (after
-    stripping styling spans) as "H:MMam - H:MMpm - Class Name". `<li>`
-    elements before the first day heading (nav menu, unrelated page content)
-    are skipped because no current day is set yet.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    out = []
-    current_day = None
-
-    for node in soup.find_all(["h6", "li"]):
-        if node.name == "h6":
-            text = node.get_text(strip=True)
-            if text in WEEKDAY_INDEX:
-                current_day = text
-            continue
-
-        if current_day is None:
-            continue
-
-        text = " ".join(node.get_text(" ", strip=True).split())
-        m = TIME_RANGE_RE.match(text)
-        if not m:
-            continue
-
-        out.append(
-            {
-                "day": current_day,
-                "start_hm": _parse_clock(m.group(1)),
-                "end_hm": _parse_clock(m.group(2)),
-                "name": m.group(3).strip(" - "),
-            }
-        )
-
-    return out
-
-
-def is_yoga(entry):
-    name = entry["name"].lower()
-    if EXCLUDE_TAG_SUBSTRING in name:
+def is_yoga(name):
+    low = name.lower()
+    if EXCLUDE_TAG_SUBSTRING in low:
         return False
-    return not any(bad in name for bad in EXCLUDE_NAME_SUBSTRINGS)
+    return not any(bad in low for bad in EXCLUDE_NAME_SUBSTRINGS)
 
 
-def dated_classes(grid, start, end):
-    """Expand the flat weekly grid into dated classes inside [start, end)."""
-    monday = (end - dt.timedelta(days=7)).date()
+# ------------------------------------------------------------- generate
+
+def generate(start, end):
+    """Expand the static grid into dated classes inside [start, end)."""
+    monday = end - dt.timedelta(days=7)
     out = []
-    for entry in grid:
-        if not is_yoga(entry):
+
+    for weekday, begins_at, ends_at, name in WEEKLY_GRID:
+        if not is_yoga(name):
             continue
-        day = monday + dt.timedelta(days=WEEKDAY_INDEX[entry["day"]])
-        begins = dt.datetime.combine(day, dt.time(*entry["start_hm"]), tzinfo=TZ)
-        ends = dt.datetime.combine(day, dt.time(*entry["end_hm"]), tzinfo=TZ)
+
+        day = (monday + dt.timedelta(days=weekday)).date()
+        begins = _at(day, begins_at)
+        ends = _at(day, ends_at)
         if not (start <= begins < end):
             continue
+
         out.append(
             {
-                "name": entry["name"],
+                "name": name,
                 "start": begins,
                 "end": ends,
-                "class_id": f"{day.isoformat()}-{entry['start_hm'][0]:02d}{entry['start_hm'][1]:02d}",
+                # Stable within a week, which is all the cleanup pass needs.
+                "class_id": f"{day.isoformat()}-{begins_at.replace(':', '')}",
             }
         )
+
     return out
 
 
@@ -232,11 +200,11 @@ def dated_classes(grid, start, end):
 
 def to_event(c):
     lines = [
-        "Instructor and cancellation info not published on this page.",
-        f"Book / confirm: {PAGE_URL}",
+        "Instructor and cancellation info not published in this source.",
+        f"Book / confirm: {BOOKING_PAGE}",
         "",
-        "From the studio's own schedule page, not a live Mindbody feed. "
-        "The page itself says the schedule is subject to change.",
+        "From the studio's published weekly schedule, transcribed by hand, "
+        f"not a live feed. Confirm at {BOOKING_PAGE} before you go.",
     ]
 
     return {
@@ -247,6 +215,7 @@ def to_event(c):
         "end": {"dateTime": c["end"].isoformat(), "timeZone": "America/Chicago"},
         "transparency": "transparent",  # shows as Free, not Busy
         "reminders": {"useDefault": False, "overrides": []},
+        "source": {"url": BOOKING_PAGE, "title": "Yoga Sangha schedule"},
         "extendedProperties": {
             "private": {
                 "source": SOURCE_TAG,
@@ -311,16 +280,9 @@ def main():
     start, end = week_window()
     print(f"Window: {start:%a %b %d %I:%M %p} through {end:%a %b %d}")
 
-    grid = parse_grid(fetch_page())
-    if not grid:
-        raise SystemExit(
-            "Parsed zero class rows from the page. The page layout probably "
-            "changed -- check PAGE_URL by hand before trusting this run."
-        )
-
-    classes = dated_classes(grid, start, end)
+    classes = generate(start, end)
     classes.sort(key=lambda c: c["start"])
-    print(f"Parsed {len(grid)} rows from the page, kept {len(classes)}")
+    print(f"Generated {len(classes)} classes for the window")
 
     if not classes:
         print("Nothing matched. Not touching the calendar.")

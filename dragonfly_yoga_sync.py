@@ -167,6 +167,10 @@ def to_event(c):
         "end": {"dateTime": ends.isoformat(), "timeZone": "America/Chicago"},
         "transparency": "transparent",  # shows as Free, not Busy
         "reminders": {"useDefault": False, "overrides": []},
+        "source": {
+            "url": f"https://app.arketa.co/{WIDGET_NAME}/calendar",
+            "title": "Dragonfly Hot Yoga booking",
+        },
         "extendedProperties": {
             "private": {
                 "source": SOURCE_TAG,

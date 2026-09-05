@@ -196,6 +196,7 @@ def to_event(c):
         "end": {"dateTime": c["end"].isoformat(), "timeZone": "America/Chicago"},
         "transparency": "transparent",  # shows as Free, not Busy
         "reminders": {"useDefault": False, "overrides": []},
+        "source": {"url": BOOKING_PAGE, "title": "Yoga Co-op booking"},
         "extendedProperties": {
             "private": {
                 "source": SOURCE_TAG,

@@ -30,3 +30,7 @@ Required in `.env`:
 
 Run any script directly: `python dragonfly_yoga_sync.py`. Each is idempotent —
 safe to re-run any time.
+
+Every event also carries the studio's booking link in Google Calendar's
+`source` field, which shows as a clickable link at the bottom of the event
+(separate from the description text, which also has it inline).

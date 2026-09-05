@@ -391,6 +391,7 @@ def to_event(c):
         "end": {"dateTime": ends.isoformat(), "timeZone": "America/Chicago"},
         "transparency": "transparent",  # shows as Free, not Busy
         "reminders": {"useDefault": False, "overrides": []},
+        "source": {"url": WIDGET_URL, "title": "Perennial Madison booking"},
         "extendedProperties": {
             "private": {
                 "source": SOURCE_TAG,

@@ -255,66 +255,52 @@ checks both, so a normally in-person class moved online for one week is skipped.
 
 ## Capital Fitness / Yoga Sangha
 
-**Revised 2026-09-05, after the Mindbody route turned out to be blocked in
-practice.** The Mindbody classic approach documented below tested clean from
-the browser, but a first real run from a plain script hit a 403 from
-`clients.mindbodyonline.com/classic/ws`: a Cloudflare "Security Check" page
-carrying a `__cf_bm` challenge cookie. That's Cloudflare bot management, not a
-missing-header problem -- confirmed by retrying with full browser-style
+**Revised twice, now hardcoded (Tier 3), same shape as Yoga Co-op.**
+
+First pass tried Mindbody classic (studioid 1956): tested clean from the
+browser, but a real run from a plain script hit a 403 from
+`clients.mindbodyonline.com/classic/ws`, a Cloudflare "Security Check" page
+carrying a `__cf_bm` challenge cookie. That's Cloudflare bot management, not
+a missing-header problem -- confirmed by retrying with full browser-style
 headers (`accept-language`, `referer`, `upgrade-insecure-requests`) and still
-getting the same challenge page. It needs a real browser to pass and isn't
-fixable from `requests` alone.
+getting the same challenge page. Needs a real browser; not fixable from
+`requests` alone.
 
-**Current script scrapes `capitalfitness.net/yoga-sangha` directly instead.**
-That page carries its own weekly schedule text, server-rendered with no JS
-needed and no bot protection at all -- confirmed by fetching it with a plain
-GET and checking the class names showed up in the raw HTML. It's a flat
-Monday-through-Sunday grid with no date attached, no instructor field, and
-no live cancellation data (the page says outright: "Schedule is subject to
-change. Please check Mindbody below for the most up to date schedule."). That
-is a step down in freshness from a live booking API, but scraping the
-studio's own page live means it updates automatically whenever they edit it
--- no manual refresh needed, unlike the Yoga Co-op script's hardcoded grid.
+Second pass scraped `capitalfitness.net/yoga-sangha` directly: that page's
+own weekly-schedule text is server-rendered with no bot protection, so a
+plain GET worked. But the live page carries an extra, undated schedule
+snippet elsewhere on it in addition to the real day-by-day grid, and the two
+didn't line up with what the studio actually publishes as "today's"
+schedule when checked by hand -- the scrape was reading the wrong copy for
+at least one day. Rather than keep chasing which block on the page is
+authoritative, this settled on the same approach as Yoga Co-op: hand-transcribe
+the schedule and hardcode it.
 
-**Parsing:** it's a Wix page. Each day is an `<h6>` heading containing just
-the day name, followed by a `<ul>` of `<li>` rows that render (after
-stripping the styling spans) as `6:30am - 7:30am - Pilates Flow`. The parser
-walks the page in document order via `find_all(['h6', 'li'])`, tracking the
-current day as headings are hit. Verified live 2026-09-05: 38 `<li>` rows
-fall inside the seven day sections (6/8/6/6/5/7/0 Mon-Sun) and all match the
-time-range regex cleanly. There are 17 stray `<li>` elements elsewhere on the
-page (nav menu items, a separate promo snippet) but all of them sit before
-the first "Monday" heading in document order, so the day-tracking state
-machine never picks them up -- confirmed by checking that none accumulate
-before the first real day heading is seen.
+**`WEEKLY_GRID` is transcribed verbatim, 2026-09-05.** No live source at all
+now -- no requests, no bs4, just `python-dotenv` and the Calendar client.
 
-**Yoga filtering.** The page has no discipline tag: it's one undifferentiated
-list of "fitness classes" per day. But `(Group Fitness)` is a literal suffix
-the studio puts on the actual non-yoga entries in that same list -- `CAPFIT
-HIIT (Group Fitness)`, `RUN CLUB (Group Fitness)`, `ZUMBA (Group Fitness)`,
-`BOOTCAMP (Group Fitness)`, `PUMP IT UP (Group Fitness)`, `TRX CIRCUIT (Group
-Fitness)` -- so that's a real structured signal, not a guess. On top of that,
-the same denylist as the old Mindbody version (`pilates`, `guided
-meditation`), since Pilates Flow/Pilates Sculpt are in the same list and the
-page has no separate Pilates category either. Verified live 2026-09-05: 38
-rows, 7 dropped as Group Fitness, 4 dropped as Pilates, 27 kept.
+**Yoga filtering** is unchanged from both earlier passes: `(Group Fitness)`
+is a literal tag the studio puts on its non-yoga classes (CAPFIT HIIT, RUN
+CLUB, ZUMBA, BOOTCAMP, PUMP IT UP, TRX CIRCUIT), dropped on that signal, plus
+a denylist for Pilates (Pilates Flow, Pilates Sculpt). 44 rows transcribed,
+11 dropped (7 Group Fitness, 4 Pilates), 33 kept.
 
-**What's lost versus the Mindbody route:** no instructor names, no live
-cancellations, no capacity/spots-left. The event description says plainly
-that this is the studio's published grid, not a live feed, and points at the
-booking page to confirm before going.
+**What's lost:** no instructor names, no live cancellations, no
+capacity/spots-left -- this source never had any of that. The event
+description says plainly this is the studio's published schedule,
+transcribed by hand, not a live feed.
 
-**What will break it:** a page redesign changing the day-heading tag away
-from `<h6>`, or dropping the literal day names, or restructuring the
-`<li>` text format. Any of those makes `parse_grid` return `[]`, and `main()`
-raises `SystemExit` loudly rather than silently writing nothing (a bare "0
-kept" for a studio that runs classes every day of the week is itself a strong
-signal something broke).
+***MAINTENANCE: this needs a manual refresh whenever the studio changes its
+schedule.*** Unlike Yoga Co-op there's no `VALID_THROUGH` date to warn you --
+there's no term structure here, the studio just changes the grid whenever it
+wants. There is no way to detect that from this source; it can go stale
+silently. Worth spot-checking `capitalfitness.net/yoga-sangha` by eye every
+so often.
 
-**Note on the address:** their page also shows a second location, "West:
-425 W Washington Ave", but the schedule grid isn't split by location and the
-Butler St address is the one this studio's Mindbody site (1956, "Capital
-Fitness- North Butler") uses, so `ADDRESS` stays the single Butler St value.
+**Note on the address:** the studio's page shows a second location, "West:
+425 W Washington Ave", but the schedule isn't split by location and the
+Butler St address is the one Mindbody site 1956 ("Capital Fitness- North
+Butler") uses, so `ADDRESS` stays the single Butler St value.
 
 ---
 

@@ -291,6 +291,7 @@ def to_event(pair):
         "end": {"dateTime": ends.isoformat(), "timeZone": "America/Chicago"},
         "transparency": "transparent",  # shows as Free, not Busy
         "reminders": {"useDefault": False, "overrides": []},
+        "source": {"url": BOOKING_PAGE, "title": "Main Street Yoga booking"},
         "extendedProperties": {
             "private": {
                 "source": SOURCE_TAG,
