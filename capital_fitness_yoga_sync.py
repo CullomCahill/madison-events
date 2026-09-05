@@ -1,8 +1,8 @@
 """
 Capital Fitness / Yoga Sangha -> Google Calendar
 
-Pulls the week ahead of yoga classes from Capital Fitness's Mindbody schedule
-and writes them into the shared "Yoga" Google Calendar.
+Pulls the week ahead of yoga classes from the studio's own website and writes
+them into the shared "Yoga" Google Calendar.
 
 Run this Monday morning. It writes from max(this Monday 00:00, right now)
 through the following Monday 00:00, local America/Chicago, so a mid-week or
@@ -12,29 +12,46 @@ Idempotent: every event it creates is stamped with a private extended
 property. On each run it deletes anything carrying that stamp inside the
 target window before writing fresh, so re-running never duplicates.
 
-WHY THIS IS TIER 2 AND NOT TIER 3
----------------------------------
-capitalfitness.net/yoga-sangha does show a fixed weekly grid in the page, and
-the brief flagged it as a possible hardcode. It isn't necessary. The page also
-embeds Mindbody site 1956, and that site still has classic branded web turned
-on, which means a plain server-rendered HTML week is available:
+WHY THIS GOES THROUGH THE WEBSITE, NOT MINDBODY
+------------------------------------------------
+This studio's Mindbody site (studioid 1956) sits behind Cloudflare bot
+management (`clients.mindbodyonline.com/classic/ws` returns a 403 "Security
+Check" page with a `__cf_bm` challenge cookie even with full browser-style
+headers). That is a JS challenge, not a missing-header problem, and it is not
+solvable with a plain HTTP client -- it would need a real browser.
 
-    GET /classic/ws?studioid=1956&stype=-7&sView=week      (opens the session)
-    GET /classic/mainclass?studioid=1956&stype=-7&view=week&date=M/D/YYYY&tg=22
+capitalfitness.net/yoga-sangha carries its own weekly schedule text directly
+in the page, server-rendered (confirmed: it's present in the raw HTML with no
+JavaScript execution, and the page itself has no bot protection). It is a
+flat Monday-through-Sunday grid with no date attached, no instructor field,
+and no live cancellation data -- the page says as much: "Schedule is subject
+to change. Please check Mindbody below for the most up to date schedule." So
+this is a step down in freshness from a live booking API, but it is a live
+scrape of the studio's own source of truth rather than a hardcoded transcript,
+so it updates automatically whenever they edit the page -- no manual refresh
+needed, unlike the Yoga Co-op script.
 
-The first request is required. Hitting mainclass cold returns a Mindbody
-sign-in page; hitting ws first sets the session cookies and then mainclass
-serves the real schedule. Both are plain GETs with a cookie jar, no login.
+HOW THE PAGE IS STRUCTURED
+---------------------------
+It's a Wix site. Each day is an `<h6>` heading containing just the day name
+("Monday", "Tuesday", ...), followed by a sibling block holding a `<ul>` of
+`<li>` entries, each rendering (once you strip the styling spans) as:
 
-That gets live instructors and, more importantly, cancellations, which the
-static grid on the website does not have.
+    6:30am - 7:30am - Pilates Flow
 
-`tg=22` is Mindbody's own service category, named "Yoga & Pilates Classes"
-(the other one is `tg=23`, "Fitness & Cycling"). That is a real structured
-signal, so it does the heavy lifting rather than class-name matching.
-
-Verified against live data 2026-09-05: the week of 2026-09-07 returned 45
-rows unfiltered, 38 rows under tg=22.
+So the parser walks the document in order via `find_all(['h6', 'li'])`,
+tracks the current day as h6 headings with day names are encountered, and
+attaches each subsequent li's parsed text to that day. This is where the
+"(Group Fitness)" tag doubles as a real structured signal:  entries like
+"CAPFIT HIIT (Group Fitness)", "RUN CLUB (Group Fitness)", "ZUMBA (Group
+Fitness)" carry that literal suffix in the source, so they're excluded on
+that alone rather than by guessing at names. Verified against the live page
+2026-09-05: 38 li entries fall inside the seven day sections (6/8/6/6/5/7/0
+Mon-Sun), all of them match the time-range regex, and there were zero strays
+from other parts of the page (17 stray `<li>` elements exist elsewhere on the
+page -- nav menu items and a separate promotional snippet -- but all of them
+sit before the first "Monday" heading in document order, so the day-tracking
+state machine never picks them up).
 
 Reads credentials from a .env file in the working directory (or any parent):
     GOOGLE_CLIENT_ID
@@ -61,36 +78,25 @@ load_dotenv()
 
 # ---------------------------------------------------------------- config
 
-STUDIO_ID = "1956"
-BASE = "https://clients.mindbodyonline.com/classic"
-SESSION_URL = f"{BASE}/ws"
-SCHEDULE_URL = f"{BASE}/mainclass"
-BOOKING_PAGE = "https://www.capitalfitness.net/yoga-sangha"
+PAGE_URL = "https://www.capitalfitness.net/yoga-sangha"
 
 STUDIO = "Yoga Sangha"
-# Mindbody site 1956 has exactly one location, "Capital Fitness- North Butler",
-# so the title omits it.
-EXPECTED_LOCATION = "Capital Fitness- North Butler"
 ADDRESS = "15 N. Butler St., Madison, WI 53703"
 
 TZ = ZoneInfo("America/Chicago")
 
-# Mindbody service category. 22 = "Yoga & Pilates Classes".
-SERVICE_CATEGORY = "22"
+DAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+WEEKDAY_INDEX = {name: i for i, name in enumerate(DAY_NAMES)}
 
-# The structured category above bundles Pilates in with yoga, and sweeps in a
-# couple of seated meditation offerings. There is no finer structured field to
-# split them, so this is a denylist applied ON TOP of the structured filter,
-# rather than the allowlist the brief asked for. The reasoning: an allowlist
-# here would need to name every yoga class the studio runs (24 distinct names
-# in the verified week alone) and would silently drop anything new they add,
-# which is the failure mode you least want in a weekly job. Case-insensitive
-# substring match on the class name. Edit freely.
-#
-# In the verified week this dropped: Pilates Flow, Pilates Sculpt,
-# Guided Meditation. Left in, deliberately: Yoga Strong, Mobility Flow,
-# Foam Roll & Flow, Meditation & Motion, Deep Restore.
+# The page has no discipline tag at all: it is one undifferentiated list of
+# "fitness classes" per day. "(Group Fitness)" is a literal suffix the studio
+# puts on the non-yoga classes in that same list (CAPFIT HIIT, RUN CLUB,
+# ZUMBA, BOOTCAMP, PUMP IT UP, TRX CIRCUIT), so that's a real structured
+# signal, not a guess. On top of that, a denylist for the two other
+# non-yoga-but-still-in-the-list categories, same as the old Mindbody version
+# of this script: Pilates and any guided meditation session.
 EXCLUDE_NAME_SUBSTRINGS = ("pilates", "guided meditation")
+EXCLUDE_TAG_SUBSTRING = "(group fitness)"
 
 CALENDAR_ID = os.environ["YOGA_CALENDAR_ID"]
 
@@ -108,6 +114,10 @@ HEADERS = {
     ),
     "accept": "text/html,application/xhtml+xml",
 }
+
+TIME_RANGE_RE = re.compile(
+    r"(\d{1,2}:\d{2}\s*[apAP][mM])\s*-\s*(\d{1,2}:\d{2}\s*[apAP][mM])\s*-\s*(.+)"
+)
 
 
 # ------------------------------------------------------------- time math
@@ -127,191 +137,107 @@ def week_window(now=None):
     return max(monday, now), monday + dt.timedelta(days=7)
 
 
+def _parse_clock(text):
+    """"6:30am" / "7:00pm" -> (hour, minute) in 24h."""
+    text = text.strip().lower().replace(" ", "")
+    m = re.match(r"(\d{1,2}):(\d{2})(am|pm)", text)
+    hour, minute, ampm = int(m.group(1)), int(m.group(2)), m.group(3)
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    return hour, minute
+
+
 # --------------------------------------------------------------- fetch
 
-def fetch_week_html(monday):
-    """Open a Mindbody session, then pull one Monday-to-Sunday week.
-
-    `view=week` starts the grid on whatever date you pass, so passing Monday
-    gives exactly the Monday-to-Sunday block we want. No slicing needed.
-    """
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    # Establishes the cookies. The body is a "you need javascript" shell that
-    # auto-submits to mainclass; we skip that and request mainclass directly.
-    session.get(
-        SESSION_URL,
-        params={"studioid": STUDIO_ID, "stype": "-7", "sView": "week"},
-        timeout=30,
-    ).raise_for_status()
-
-    resp = session.get(
-        SCHEDULE_URL,
-        params={
-            "studioid": STUDIO_ID,
-            "stype": "-7",
-            "view": "week",
-            "date": f"{monday.month}/{monday.day}/{monday.year}",
-            "tg": SERVICE_CATEGORY,
-        },
-        timeout=30,
-    )
+def fetch_page():
+    resp = requests.get(PAGE_URL, headers=HEADERS, timeout=30)
     resp.raise_for_status()
     return resp.text
 
 
-def _column_names(soup):
-    """Build the column order for the class cells from the table's own header
-    row rather than assuming it.
+def parse_grid(html):
+    """Walk the page in document order, tracking the current day heading, and
+    return a flat list of {day, start_hm, end_hm, name} dicts.
 
-    Mindbody renders each row as
-        .col-1  ->  [start time, sign-up button]
-        .col-2  ->  [the remaining columns, in header order]
-    and which columns exist varies by site: sites with one location sometimes
-    drop the Location column entirely. Reading the header keeps the field
-    mapping honest instead of guessing by position.
+    Day headings are `<h6>` elements whose text is exactly a day name. Class
+    rows are `<li>` elements that appear after one, each rendering (after
+    stripping styling spans) as "H:MMam - H:MMpm - Class Name". `<li>`
+    elements before the first day heading (nav menu, unrelated page content)
+    are skipped because no current day is set yet.
     """
-    header = soup.select_one("#classSchedule-header")
-    if not header:
-        raise RuntimeError("schedule header not found; the page shape changed")
-    ids = [d.get("id", "") for d in header.select(".floatingHeader")]
-    # Drop the two that live in col-1.
-    return [i for i in ids if i not in ("startTimeHeader", "signUpNowHeader")]
-
-
-TIME_RE = re.compile(r"(\d{1,2}):(\d{2})\s*(am|pm)", re.I)
-# Durations arrive as "1 hour", "45 minutes", or "1 hour & 15 minutes". Match
-# the two parts separately: a single combined pattern quietly returns 60 for
-# the third form because of the ampersand between the halves.
-HOUR_RE = re.compile(r"(\d+)\s*hour", re.I)
-MIN_RE = re.compile(r"(\d+)\s*minute", re.I)
-
-
-def parse_week(html):
-    """Walk the schedule table in document order, carrying the current day
-    header, and return a list of plain dicts."""
     soup = BeautifulSoup(html, "html.parser")
-    table = soup.select_one("#classSchedule-mainTable")
-    if not table:
-        return []
-
-    columns = _column_names(soup)
     out = []
-    current_date = None
+    current_day = None
 
-    for node in table.find_all("div", recursive=False):
-        classes = node.get("class") or []
-
-        if "header" in classes:
-            # e.g. "Mon September 7, 2026"
-            text = " ".join(node.get_text(" ", strip=True).split())
-            m = re.search(r"([A-Z][a-z]+ \d{1,2}, \d{4})", text)
-            current_date = (
-                dt.datetime.strptime(m.group(1), "%B %d, %Y").date() if m else None
-            )
+    for node in soup.find_all(["h6", "li"]):
+        if node.name == "h6":
+            text = node.get_text(strip=True)
+            if text in WEEKDAY_INDEX:
+                current_day = text
             continue
 
-        if "row" not in classes or current_date is None:
+        if current_day is None:
             continue
 
-        first = node.select_one(".col-1 .col.col-first")
-        if not first:
-            continue
-        raw_time = first.get_text(" ", strip=True).replace("\xa0", " ")
-
-        cells = [c.get_text(" ", strip=True).replace("\xa0", " ")
-                 for c in node.select(".col-2 .col")]
-        record = dict(zip(columns, cells))
-
-        m = TIME_RE.search(raw_time)
+        text = " ".join(node.get_text(" ", strip=True).split())
+        m = TIME_RANGE_RE.match(text)
         if not m:
             continue
-        hour, minute, ampm = int(m.group(1)), int(m.group(2)), m.group(3).lower()
-        if ampm == "pm" and hour != 12:
-            hour += 12
-        if ampm == "am" and hour == 12:
-            hour = 0
-        begins = dt.datetime.combine(
-            current_date, dt.time(hour, minute), tzinfo=TZ
-        )
-
-        duration_text = record.get("durationHeader", "")
-        minutes = 0
-        mh = HOUR_RE.search(duration_text)
-        mm = MIN_RE.search(duration_text)
-        if mh:
-            minutes += int(mh.group(1)) * 60
-        if mm:
-            minutes += int(mm.group(1))
-        if minutes == 0:
-            minutes = 60  # last resort, so a parse miss is still a sane block
 
         out.append(
             {
-                "name": record.get("classNameHeader", "").strip(),
-                "instructor": record.get("trainerNameHeader", "").strip(),
-                "location": record.get("locationNameHeader", "").strip(),
-                "room": record.get("resourceNameHeader", "").strip(),
-                "start": begins,
-                "end": begins + dt.timedelta(minutes=minutes),
-                # Mindbody strikes through the time and the class name of a
-                # cancelled class and replaces the instructor cell with
-                # "Cancelled ...". Check both; the <s> tag is the reliable one.
-                "cancelled": bool(node.find("s"))
-                or record.get("trainerNameHeader", "").lower().startswith("cancel"),
-                # From the Sign Up Now handler: ...classId=2302&classDate=...
-                "class_id": _class_id(node),
+                "day": current_day,
+                "start_hm": _parse_clock(m.group(1)),
+                "end_hm": _parse_clock(m.group(2)),
+                "name": m.group(3).strip(" - "),
             }
         )
 
     return out
 
 
-def _class_id(node):
-    """Mindbody's own class id, pulled out of the sign-up button's onclick.
-    Falls back to None for cancelled rows, which have no button."""
-    button = node.select_one(".col-1 input[onclick]")
-    if not button:
-        return None
-    m = re.search(r"classId=(\d+)", button.get("onclick", ""))
-    return m.group(1) if m else None
+def is_yoga(entry):
+    name = entry["name"].lower()
+    if EXCLUDE_TAG_SUBSTRING in name:
+        return False
+    return not any(bad in name for bad in EXCLUDE_NAME_SUBSTRINGS)
 
 
-def is_yoga(name):
-    low = (name or "").lower()
-    return not any(bad in low for bad in EXCLUDE_NAME_SUBSTRINGS)
-
-
-def keep(c, start, end):
-    if c["cancelled"]:
-        return False
-    # Single physical location. Anything else would be a new site, a second
-    # studio, or a livestream entry, and is worth not writing silently.
-    if c["location"] and c["location"] != EXPECTED_LOCATION:
-        return False
-    if not c["name"]:
-        return False
-    if not is_yoga(c["name"]):
-        return False
-    return start <= c["start"] < end
+def dated_classes(grid, start, end):
+    """Expand the flat weekly grid into dated classes inside [start, end)."""
+    monday = (end - dt.timedelta(days=7)).date()
+    out = []
+    for entry in grid:
+        if not is_yoga(entry):
+            continue
+        day = monday + dt.timedelta(days=WEEKDAY_INDEX[entry["day"]])
+        begins = dt.datetime.combine(day, dt.time(*entry["start_hm"]), tzinfo=TZ)
+        ends = dt.datetime.combine(day, dt.time(*entry["end_hm"]), tzinfo=TZ)
+        if not (start <= begins < end):
+            continue
+        out.append(
+            {
+                "name": entry["name"],
+                "start": begins,
+                "end": ends,
+                "class_id": f"{day.isoformat()}-{entry['start_hm'][0]:02d}{entry['start_hm'][1]:02d}",
+            }
+        )
+    return out
 
 
 # ------------------------------------------------------- event building
 
 def to_event(c):
-    lines = []
-    if c["instructor"]:
-        lines.append(f"Instructor: {c['instructor']}")
-    if c["room"]:
-        lines.append(f"Room: {c['room']}")
-    # The classic schedule carries no intensity field and no inline class
-    # description; descriptions live behind a modal keyed to a separate id.
-    lines.append(f"Book: {BOOKING_PAGE}")
-
-    private = {"source": SOURCE_TAG}
-    if c["class_id"]:
-        private["classId"] = c["class_id"]
+    lines = [
+        "Instructor and cancellation info not published on this page.",
+        f"Book / confirm: {PAGE_URL}",
+        "",
+        "From the studio's own schedule page, not a live Mindbody feed. "
+        "The page itself says the schedule is subject to change.",
+    ]
 
     return {
         "summary": f"{STUDIO} - {c['name']}",
@@ -321,7 +247,12 @@ def to_event(c):
         "end": {"dateTime": c["end"].isoformat(), "timeZone": "America/Chicago"},
         "transparency": "transparent",  # shows as Free, not Busy
         "reminders": {"useDefault": False, "overrides": []},
-        "extendedProperties": {"private": private},
+        "extendedProperties": {
+            "private": {
+                "source": SOURCE_TAG,
+                "classId": c["class_id"],
+            }
+        },
     }
 
 
@@ -378,13 +309,18 @@ def clear_window(svc, start, end):
 
 def main():
     start, end = week_window()
-    monday = end - dt.timedelta(days=7)
     print(f"Window: {start:%a %b %d %I:%M %p} through {end:%a %b %d}")
 
-    raw = parse_week(fetch_week_html(monday))
-    classes = [c for c in raw if keep(c, start, end)]
+    grid = parse_grid(fetch_page())
+    if not grid:
+        raise SystemExit(
+            "Parsed zero class rows from the page. The page layout probably "
+            "changed -- check PAGE_URL by hand before trusting this run."
+        )
+
+    classes = dated_classes(grid, start, end)
     classes.sort(key=lambda c: c["start"])
-    print(f"Fetched {len(raw)} classes, kept {len(classes)}")
+    print(f"Parsed {len(grid)} rows from the page, kept {len(classes)}")
 
     if not classes:
         print("Nothing matched. Not touching the calendar.")

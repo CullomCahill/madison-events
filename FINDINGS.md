@@ -10,7 +10,7 @@ Same `.env`, same `calendar_service()`, same `YOGA_CALENDAR_ID`.
 | Perennial Yoga (Madison) | `perennial_yoga_sync.py` | `perennial-yoga-sync` | 1 | Mindbody "go" widget, Next.js server action |
 | Sukha Somatics | `sukha_yoga_sync.py` | `sukha-yoga-sync` | 1 | Momence read-only host API |
 | Main Street Yoga Center | `main_street_yoga_sync.py` | `main-street-yoga-sync` | 1 | WellnessLiving Explore REST API |
-| Capital Fitness / Yoga Sangha | `capital_fitness_yoga_sync.py` | `capital-fitness-yoga-sync` | 2 | Mindbody classic, server-rendered HTML |
+| Capital Fitness / Yoga Sangha | `capital_fitness_yoga_sync.py` | `capital-fitness-yoga-sync` | 2, revised | Studio's own website, server-rendered HTML (Mindbody classic is Cloudflare-blocked) |
 | Yoga Co-op of Madison | `yoga_coop_sync.py` | `yoga-coop-sync` | 3 | Hardcoded from the term PDF |
 
 Nobody needed a headless browser. Main Street looked like it would and didn't,
@@ -255,68 +255,66 @@ checks both, so a normally in-person class moved online for one week is skipped.
 
 ## Capital Fitness / Yoga Sangha
 
-**Tier 2, and it did not need to be Tier 3.** You flagged this as a possible
-hardcode. It isn't, and using the live source gets you instructors and
-cancellations that the static grid on the website does not have.
+**Revised 2026-09-05, after the Mindbody route turned out to be blocked in
+practice.** The Mindbody classic approach documented below tested clean from
+the browser, but a first real run from a plain script hit a 403 from
+`clients.mindbodyonline.com/classic/ws`: a Cloudflare "Security Check" page
+carrying a `__cf_bm` challenge cookie. That's Cloudflare bot management, not a
+missing-header problem -- confirmed by retrying with full browser-style
+headers (`accept-language`, `referer`, `upgrade-insecure-requests`) and still
+getting the same challenge page. It needs a real browser to pass and isn't
+fixable from `requests` alone.
 
-The `yoga-sangha` page embeds Mindbody through Wix, healcode site 66785,
-**Mindbody site 1956** ("Capital Fitness- North Butler"). Unlike Perennial
-Madison, that site still has classic branded web enabled:
+**Current script scrapes `capitalfitness.net/yoga-sangha` directly instead.**
+That page carries its own weekly schedule text, server-rendered with no JS
+needed and no bot protection at all -- confirmed by fetching it with a plain
+GET and checking the class names showed up in the raw HTML. It's a flat
+Monday-through-Sunday grid with no date attached, no instructor field, and
+no live cancellation data (the page says outright: "Schedule is subject to
+change. Please check Mindbody below for the most up to date schedule."). That
+is a step down in freshness from a live booking API, but scraping the
+studio's own page live means it updates automatically whenever they edit it
+-- no manual refresh needed, unlike the Yoga Co-op script's hardcoded grid.
 
-```
-GET /classic/ws?studioid=1956&stype=-7&sView=week            (opens the session)
-GET /classic/mainclass?studioid=1956&stype=-7&view=week&date=M/D/YYYY&tg=22
-```
+**Parsing:** it's a Wix page. Each day is an `<h6>` heading containing just
+the day name, followed by a `<ul>` of `<li>` rows that render (after
+stripping the styling spans) as `6:30am - 7:30am - Pilates Flow`. The parser
+walks the page in document order via `find_all(['h6', 'li'])`, tracking the
+current day as headings are hit. Verified live 2026-09-05: 38 `<li>` rows
+fall inside the seven day sections (6/8/6/6/5/7/0 Mon-Sun) and all match the
+time-range regex cleanly. There are 17 stray `<li>` elements elsewhere on the
+page (nav menu items, a separate promo snippet) but all of them sit before
+the first "Monday" heading in document order, so the day-tracking state
+machine never picks them up -- confirmed by checking that none accumulate
+before the first real day heading is seen.
 
-**The first request is required.** Hitting `mainclass` cold gets you a Mindbody
-sign-in page; hitting `ws` first sets the session cookies and then `mainclass`
-serves real HTML. Both are plain GETs with a cookie jar, no login. `view=week`
-starts the grid on whatever date you pass, so passing Monday gives exactly
-Monday through Sunday, no slicing.
+**Yoga filtering.** The page has no discipline tag: it's one undifferentiated
+list of "fitness classes" per day. But `(Group Fitness)` is a literal suffix
+the studio puts on the actual non-yoga entries in that same list -- `CAPFIT
+HIIT (Group Fitness)`, `RUN CLUB (Group Fitness)`, `ZUMBA (Group Fitness)`,
+`BOOTCAMP (Group Fitness)`, `PUMP IT UP (Group Fitness)`, `TRX CIRCUIT (Group
+Fitness)` -- so that's a real structured signal, not a guess. On top of that,
+the same denylist as the old Mindbody version (`pilates`, `guided
+meditation`), since Pilates Flow/Pilates Sculpt are in the same list and the
+page has no separate Pilates category either. Verified live 2026-09-05: 38
+rows, 7 dropped as Group Fitness, 4 dropped as Pilates, 27 kept.
 
-The page also carries the same `go.mindbodyonline.com` widget Perennial Madison
-uses (widget id `3f28342c0d4`). I used classic instead: it is far more stable
-and it has a structured category filter.
+**What's lost versus the Mindbody route:** no instructor names, no live
+cancellations, no capacity/spots-left. The event description says plainly
+that this is the studio's published grid, not a live feed, and points at the
+booking page to confirm before going.
 
-**Structured yoga signal:** `tg=22` is Mindbody's own service category, named
-**"Yoga & Pilates Classes"**. The other is `tg=23`, "Fitness & Cycling". Live
-week of 2026-09-07: **45 rows unfiltered, 38 under `tg=22`, 38 parsed cleanly,
-35 kept** after removing Pilates and Guided Meditation.
+**What will break it:** a page redesign changing the day-heading tag away
+from `<h6>`, or dropping the literal day names, or restructuring the
+`<li>` text format. Any of those makes `parse_grid` return `[]`, and `main()`
+raises `SystemExit` loudly rather than silently writing nothing (a bare "0
+kept" for a studio that runs classes every day of the week is itself a strong
+signal something broke).
 
-**Parsing:** rows are `.evenRow row` / `.oddRow row` divs interleaved with
-`.header` day dividers, all direct children of `#classSchedule-mainTable`, so
-the parser walks in document order carrying the current date. Rather than
-assume column positions, `_column_names()` reads the table's own header row
-(`#classNameHeader`, `#trainerNameHeader`, `#locationNameHeader`,
-`#resourceNameHeader`, `#durationHeader`) and zips it against the cells. This
-matters: Perennial's Fitchburg site renders the same table **without** the
-Location column, so a positional parser would silently read the room as the
-location.
-
-**Cancellations:** Mindbody wraps the time and class name in `<s>` and replaces
-the instructor cell with a red "Cancelled Today". The parser checks both.
-Verified against a real cancelled ZUMBA class on 2026-09-05.
-
-**A bug I caught in my own first draft:** durations arrive as `1 hour`,
-`45 minutes`, or `1 hour & 15 minutes`. A single combined regex quietly returns
-60 for the third form, because of the ampersand between the halves. Every
-75-minute class would have been written 15 minutes short. Hours and minutes are
-now matched separately, and the fixture test asserts 75.
-
-**Yoga filtering, and where I deviated from the brief.** `tg=22` bundles Pilates
-in with yoga and sweeps in a couple of seated meditation classes, and there is
-no finer structured field. On top of the structured filter I used a **denylist**
-(`pilates`, `guided meditation`) rather than the allowlist you asked for. The
-reasoning: an allowlist here would have to name every yoga class they run, 24
-distinct names in the verified week alone, and would silently drop anything new
-they add. Silent drops are the worst failure mode for a weekly job. Deliberately
-left in: Yoga Strong, Mobility Flow, Foam Roll & Flow, Meditation & Motion,
-Deep Restore. One line to change if you disagree.
-
-**Note on the address:** their page labels it "East: 15 N. Butler St." Mindbody
-site 1956 has exactly one location, so there is no second Yoga Sangha site to
-sync. If they add one, the location check will start dropping classes rather
-than silently mislabelling them.
+**Note on the address:** their page also shows a second location, "West:
+425 W Washington Ave", but the schedule grid isn't split by location and the
+Butler St address is the one this studio's Mindbody site (1956, "Capital
+Fitness- North Butler") uses, so `ADDRESS` stays the single Butler St value.
 
 ---
 
@@ -366,10 +364,13 @@ Ranked by how likely they are to bite you.
    filter becomes a no-op and nothing breaks. If they change the period schema,
    you would start losing real classes silently. Worth eyeballing the
    "Fetched N, kept M" line occasionally.
-3. **Capital Fitness's session bootstrap.** If Mindbody retires classic branded
-   web for site 1956, `parse_week` returns `[]` and the script says "Nothing
-   matched" without touching the calendar. The fallback is the same
-   `go.mindbodyonline.com` widget Perennial uses, id `3f28342c0d4`.
+3. **Capital Fitness's page layout.** Mindbody classic for site 1956 turned
+   out to be Cloudflare-blocked (see the studio's section above), so the
+   script scrapes `capitalfitness.net/yoga-sangha` directly instead. If that
+   page's day headings stop being plain `<h6>Monday</h6>` text, `parse_grid`
+   returns `[]` and `main()` raises `SystemExit` loudly rather than silently
+   skipping the week. There's also no instructor or cancellation data on this
+   route -- accepted as the cost of a source that isn't bot-blocked.
 4. **The Yoga Co-op PDF expiring.** Handled by the warning, but it is on you.
 5. **Every name-based yoga filter.** Sukha, Main Street and Perennial all fall
    back to names because none of them expose a usable discipline tag. New class
