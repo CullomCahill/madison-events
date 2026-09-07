@@ -48,11 +48,14 @@ Requires:
 
 import datetime as dt
 import os
+import random
+import time
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 load_dotenv()
 
@@ -140,18 +143,18 @@ SOURCE_TAG = "capital-fitness-yoga-sync"
 # ------------------------------------------------------------- time math
 
 def week_window(now=None):
-    """Return (start, end) for the current Monday-to-Monday week, with the
-    start clamped to now.
+    """Return (start, end) covering the current week plus the following
+    one, with the start clamped to now.
 
-    end is always the following Monday 00:00 local. start is whichever is
-    later of this week's Monday 00:00 and the current moment, so a Wednesday
-    or Saturday re-run only ever writes what is still ahead.
+    end is always the Monday 00:00 local two weeks out. start is whichever
+    is later of this week's Monday 00:00 and the current moment, so a
+    Wednesday or Saturday re-run only ever writes what is still ahead.
     """
     now = now or dt.datetime.now(TZ)
     monday = (now - dt.timedelta(days=now.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
-    return max(monday, now), monday + dt.timedelta(days=7)
+    return max(monday, now), monday + dt.timedelta(days=14)
 
 
 def _at(day, hhmm):
@@ -169,29 +172,35 @@ def is_yoga(name):
 # ------------------------------------------------------------- generate
 
 def generate(start, end):
-    """Expand the static grid into dated classes inside [start, end)."""
-    monday = end - dt.timedelta(days=7)
+    """Expand the static weekly grid into dated classes inside [start, end),
+    repeating it for every week the window spans."""
+    first_monday = (start - dt.timedelta(days=start.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
     out = []
 
-    for weekday, begins_at, ends_at, name in WEEKLY_GRID:
-        if not is_yoga(name):
-            continue
+    monday = first_monday
+    while monday < end:
+        for weekday, begins_at, ends_at, name in WEEKLY_GRID:
+            if not is_yoga(name):
+                continue
 
-        day = (monday + dt.timedelta(days=weekday)).date()
-        begins = _at(day, begins_at)
-        ends = _at(day, ends_at)
-        if not (start <= begins < end):
-            continue
+            day = (monday + dt.timedelta(days=weekday)).date()
+            begins = _at(day, begins_at)
+            ends = _at(day, ends_at)
+            if not (start <= begins < end):
+                continue
 
-        out.append(
-            {
-                "name": name,
-                "start": begins,
-                "end": ends,
-                # Stable within a week, which is all the cleanup pass needs.
-                "class_id": f"{day.isoformat()}-{begins_at.replace(':', '')}",
-            }
-        )
+            out.append(
+                {
+                    "name": name,
+                    "start": begins,
+                    "end": ends,
+                    # Dated, so it stays unique across repeated weeks.
+                    "class_id": f"{day.isoformat()}-{begins_at.replace(':', '')}",
+                }
+            )
+        monday += dt.timedelta(days=7)
 
     return out
 
@@ -248,6 +257,28 @@ def calendar_service():
     return build("calendar", "v3", credentials=creds, cache_discovery=False)
 
 
+def execute_with_backoff(request, max_tries=6):
+    """Run a Calendar API request, retrying transient failures with
+    exponential backoff plus jitter.
+
+    The six sync scripts in this repo run as parallel GitHub Actions matrix
+    jobs, all writing to the same calendar at once, which can trip Google's
+    short-burst rate limiting well under any daily quota. Retrying with
+    backoff rides that out instead of failing the job.
+    """
+    for attempt in range(max_tries):
+        try:
+            return request.execute()
+        except HttpError as e:
+            status = e.resp.status
+            transient = status in (429, 500, 503) or (
+                status == 403 and "ratelimitexceeded" in str(e).lower()
+            )
+            if not transient or attempt == max_tries - 1:
+                raise
+            time.sleep(2**attempt + random.uniform(0, 1))
+
+
 def clear_window(svc, start, end):
     """Delete previously synced events in the window. Only touches events
     carrying our own stamp, so anything you added by hand is safe.
@@ -258,17 +289,21 @@ def clear_window(svc, start, end):
     removed = 0
     page = None
     while True:
-        resp = svc.events().list(
-            calendarId=CALENDAR_ID,
-            timeMin=start.isoformat(),
-            timeMax=end.isoformat(),
-            privateExtendedProperty=f"source={SOURCE_TAG}",
-            singleEvents=True,
-            maxResults=250,
-            pageToken=page,
-        ).execute()
+        resp = execute_with_backoff(
+            svc.events().list(
+                calendarId=CALENDAR_ID,
+                timeMin=start.isoformat(),
+                timeMax=end.isoformat(),
+                privateExtendedProperty=f"source={SOURCE_TAG}",
+                singleEvents=True,
+                maxResults=250,
+                pageToken=page,
+            )
+        )
         for ev in resp.get("items", []):
-            svc.events().delete(calendarId=CALENDAR_ID, eventId=ev["id"]).execute()
+            execute_with_backoff(
+                svc.events().delete(calendarId=CALENDAR_ID, eventId=ev["id"])
+            )
             removed += 1
         page = resp.get("nextPageToken")
         if not page:
@@ -293,7 +328,7 @@ def main():
 
     for c in classes:
         ev = to_event(c)
-        svc.events().insert(calendarId=CALENDAR_ID, body=ev).execute()
+        execute_with_backoff(svc.events().insert(calendarId=CALENDAR_ID, body=ev))
         print(f"  {c['start']:%a %m/%d %I:%M %p}  {ev['summary']}")
 
     print(f"Wrote {len(classes)} events")
